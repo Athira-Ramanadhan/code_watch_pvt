@@ -1,0 +1,6 @@
+flask
+flask-cors
+werkzeug
+scikit-learn
+fuzzywuzzy[speedup]
+python-Levenshtein

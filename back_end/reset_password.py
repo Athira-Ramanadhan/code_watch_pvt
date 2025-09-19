@@ -5,7 +5,7 @@ import secrets
 import logging
 from urllib.parse import urlencode
 from typing import Optional
-from database import get_conn
+from database import safe_execute, clear_reset_token_by_token, clear_reset_token_by_email
 from email_sender import send_reset_email_smtp
 
 LOG = logging.getLogger("reset_password")
@@ -19,23 +19,29 @@ FRONTEND_RESET_URL = os.environ.get(
     "http://localhost:3000/reset-password"  # change if your frontend runs elsewhere
 )
 
+
+# ----------------- Create Reset Token -----------------
 def create_reset_token(email: str) -> Optional[str]:
     """Create a token for `email`, store it, and send a reset email."""
     try:
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM users WHERE email = ?", (email.lower(),))
-            if not cur.fetchone():
-                LOG.info("create_reset_token: email not found: %s", email)
-                return None
+        # Check if email exists
+        cur = safe_execute(
+            "SELECT id FROM users WHERE email = ?",
+            (email.lower(),),
+            commit=False
+        )
+        if not cur.fetchone():
+            LOG.info("create_reset_token: email not found: %s", email)
+            return None
 
-            token = secrets.token_urlsafe(TOKEN_BYTES)
-            expires = int(time.time()) + TOKEN_TTL_SECONDS
-            conn.execute(
-                "UPDATE users SET reset_token = ?, reset_expires = ? WHERE email = ?",
-                (token, expires, email.lower())
-            )
-            conn.commit()
+        # Generate token + expiry
+        token = secrets.token_urlsafe(TOKEN_BYTES)
+        expires = int(time.time()) + TOKEN_TTL_SECONDS
+
+        safe_execute(
+            "UPDATE users SET reset_token = ?, reset_expires = ? WHERE email = ?",
+            (token, expires, email.lower())
+        )
 
         LOG.info("create_reset_token: token created for %s (expires %d)", email, expires)
 
@@ -49,42 +55,49 @@ def create_reset_token(email: str) -> Optional[str]:
         LOG.exception("create_reset_token: unexpected error for %s: %s", email, e)
         return None
 
+
+# ----------------- Validate Token -----------------
 def validate_reset_token(token: str) -> Optional[str]:
-    """Return the associated email if token exists and not expired, else None."""
+    """Return the associated email if token exists and not expired, else None.
+       If expired, automatically clear it."""
     try:
         now = int(time.time())
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT email FROM users WHERE reset_token = ? AND reset_expires >= ?",
-                (token, now)
-            )
-            row = cur.fetchone()
+        cur = safe_execute(
+            "SELECT email, reset_expires FROM users WHERE reset_token = ?",
+            (token,),
+            commit=False
+        )
+        row = cur.fetchone()
 
-        if row:
-            try:
-                return row["email"]
-            except Exception:
-                return row[0]
+        if not row:
+            return None
+
+        email = row["email"] if "email" in row.keys() else row[0]
+        expires = row["reset_expires"] if "reset_expires" in row.keys() else row[1]
+
+        if expires and expires >= now:
+            return email
+
+        # ❌ expired — clear it
+        clear_reset_token_by_token(token)
+        LOG.info("validate_reset_token: expired token cleared for %s", email)
         return None
     except Exception as e:
         LOG.exception("validate_reset_token: error validating token: %s", e)
         return None
 
+
+# ----------------- Clear Token -----------------
 def clear_reset_token(email: str) -> None:
-    """Clear token fields for the given email."""
+    """Clear token fields for the given email after successful reset."""
     try:
-        with get_conn() as conn:
-            conn.execute(
-                "UPDATE users SET reset_token = NULL, reset_expires = NULL WHERE email = ?",
-                (email.lower(),)
-            )
-            conn.commit()
+        clear_reset_token_by_email(email)
         LOG.info("clear_reset_token: cleared token for %s", email)
     except Exception as e:
         LOG.exception("clear_reset_token: error clearing token for %s: %s", email, e)
 
-# Optional: keep for debugging only
+
+# ----------------- Debug Helper -----------------
 def send_reset_email_console(email: str, token: str) -> None:
     """Print a clickable reset link to the server console (for development)."""
     try:
